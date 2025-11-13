@@ -164,3 +164,8 @@ src/hgan/_version.py
 src/hgan/output/
 src/slurm-*
 TimeGAN
+data
+hamiltonian-nn
+hnn_model
+results
+hnn_comparison_data

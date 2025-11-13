@@ -367,65 +367,6 @@ class TrajectoryGenerator(nn.Module):
         traj = output * mask
         return traj
 
-class FiLMLayer(nn.Module):
-    def __init__(self, feature_dim, cond_dim):
-        super().__init__()
-        self.gamma_fc = nn.Linear(cond_dim, feature_dim)
-        self.beta_fc = nn.Linear(cond_dim, feature_dim)
-
-    def forward(self, x, cond):
-        """
-        x: [batch, T, feature_dim]
-        cond: [batch, T, cond_dim]
-        """
-        gamma = self.gamma_fc(cond)
-        beta = self.beta_fc(cond)
-        return gamma * x + beta
-
-class FiLMDecoder(nn.Module):
-    def __init__(self, latent_dim, cond_dim, hidden_dim=128, num_layers = 3, traj_len=30, n_particles=10):
-        super().__init__()
-        self.traj_len = traj_len
-        self.n_particles = n_particles
-        self.traj_dim = 2
-        self.output_dim = self.traj_dim * n_particles
-
-        self.layers = nn.ModuleList()
-        self.film_layers = nn.ModuleList()
-
-        in_dim = latent_dim
-        for i in range(num_layers):
-            self.layers.append(nn.Linear(in_dim, hidden_dim))
-            self.film_layers.append(FiLMLayer(hidden_dim, cond_dim))
-            in_dim = hidden_dim
-
-        self.output_layer = nn.Linear(hidden_dim, self.output_dim)
-
-    def forward(self, latent_seq, cond, mask):
-        """
-        latent_seq: [batch, T, latent_dim]
-        cond: [batch, T, cond_dim]
-        mask: [batch * T, n_particles] or [batch, n_particles]
-        """
-        import torch.nn.functional as F
-
-        batch_size, T, _ = latent_seq.shape
-        x = latent_seq  # [batch, T, latent_dim]
-
-        for linear, film in zip(self.layers, self.film_layers):
-            x = linear(x)
-            x = film(x, cond)
-            x = F.relu(x)
-
-        x = self.output_layer(x)  # [batch, T, traj_dim * n_particles]
-        x = x.view(batch_size, T, self.traj_dim, self.n_particles)  # [batch, T, 2, n_particles]
-
-        # Expand and apply mask
-        mask = mask.view(batch_size, 1, 1, self.n_particles)
-        mask = mask.expand(batch_size, T, self.traj_dim, self.n_particles)
-        traj = x * mask  # Apply mask to zero-out invalid particles
-        return traj    
-
 class TrajectoryDiscriminator(nn.Module):
     
     def __init__(self, cond_dim, hidden_dim=128, num_layers=2, pos_dim = 2, bidirectional=True, max_n = 3):
