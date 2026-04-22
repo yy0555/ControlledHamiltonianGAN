@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(kill 2396209)",
+      "Bash(rm -rf /home/yyang/ControlledHamiltonianGAN/src/hgan/output/*)",
+      "Bash(kill 2410853)",
+      "Bash(kill 2412172)",
+      "Bash(tmux kill-session *)"
+    ]
+  }
+}

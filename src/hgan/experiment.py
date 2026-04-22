@@ -1,4 +1,5 @@
 import logging
+import os
 import os.path
 import time
 import glob
@@ -7,13 +8,21 @@ import skvideo.io
 from skimage.transform import resize
 import importlib
 import torch
+import torch.distributed as dist
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.autograd import Variable
 
 import hgan.data
 from hgan.configuration import save_config
 from hgan.models import GRU, HNNSimple, HNNPhaseSpace, HNNMass
-from hgan.dataset import RealtimeDataset, HGNRealtimeDataset, ToyPhysicsDatasetNPZ
+from hgan.dataset import (
+    RealtimeDataset,
+    HGNRealtimeDataset,
+    ToyPhysicsDatasetNPZ,
+    RealPendulumVideoDataset,
+)
 from hgan.utils import setup_reproducibility, timeSince
 from hgan.fvd import compute_fvd
 from hgan.models import Discriminator_I, Discriminator_V, Generator_I
@@ -21,6 +30,11 @@ from hgan.updates import update_models
 
 
 logger = logging.getLogger(__name__)
+
+
+def _unwrap(module):
+    """Return the underlying module if wrapped in DDP, else the module itself."""
+    return module.module if isinstance(module, DDP) else module
 
 
 class Experiment:
@@ -61,7 +75,22 @@ class Experiment:
         else:
             self.datapath = None
 
-        if config.experiment.gpu is None or not torch.cuda.is_available():
+        # DDP detection: torchrun sets LOCAL_RANK/RANK/WORLD_SIZE. If those
+        # env vars are present and WORLD_SIZE>1 we run in distributed mode.
+        local_rank_env = os.environ.get("LOCAL_RANK", "")
+        world_size_env = os.environ.get("WORLD_SIZE", "1")
+        self.world_size = int(world_size_env) if world_size_env else 1
+        self.local_rank = int(local_rank_env) if local_rank_env != "" else -1
+        self.rank = int(os.environ.get("RANK", "0"))
+        self.is_ddp = self.world_size > 1 and self.local_rank >= 0
+        self.is_main = self.rank == 0  # true for single-proc runs as well
+
+        if self.is_ddp:
+            if not dist.is_initialized():
+                dist.init_process_group(backend="nccl")
+            torch.cuda.set_device(self.local_rank)
+            self.device = f"cuda:{self.local_rank}"
+        elif config.experiment.gpu is None or not torch.cuda.is_available():
             self.device = "cpu"
         else:
             self.device = f"cuda:{config.experiment.gpu}"
@@ -112,6 +141,29 @@ class Experiment:
                 img_size=config.experiment.img_size,
                 normalize=config.video.normalize,
             )
+        elif config.experiment.rt_data_generator == "real_pendulum":
+            data_dir = config.experiment.real_pendulum_data_dir
+            video_filename = getattr(
+                config.experiment, "real_pendulum_video_filename", "DP_free_drop_video.mp4"
+            )
+            stride = getattr(config.experiment, "real_pendulum_stride", 1)
+            motion_percentile = getattr(
+                config.experiment, "real_pendulum_motion_percentile", 0
+            )
+            dataset = RealPendulumVideoDataset(
+                data_dir=data_dir,
+                video_filename=video_filename,
+                num_frames=config.video.generator_frames,
+                img_size=config.experiment.img_size,
+                ndim_channel=config.experiment.ndim_channel,
+                ndim_label=config.experiment.ndim_label,
+                ndim_physics=config.experiment.ndim_physics,
+                ndim_color=config.experiment.ndim_color,
+                stride=stride,
+                normalize=config.video.normalize,
+                train=True,
+                motion_percentile=float(motion_percentile),
+            )
         else:
             dataset = ToyPhysicsDatasetNPZ(
                 datapath=self.datapath, num_frames=config.video.generator_frames
@@ -120,12 +172,29 @@ class Experiment:
         if len(dataset) == 0:
             raise RuntimeError("No videos found!")
 
-        self.dataloader = DataLoader(
-            dataset,
-            batch_size=config.experiment.batch_size,
-            shuffle=True,
-            pin_memory=True,
-        )
+        if self.is_ddp:
+            self._sampler = DistributedSampler(
+                dataset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=True,
+                drop_last=True,
+            )
+            self.dataloader = DataLoader(
+                dataset,
+                batch_size=config.experiment.batch_size,
+                sampler=self._sampler,
+                pin_memory=True,
+                drop_last=True,
+            )
+        else:
+            self._sampler = None
+            self.dataloader = DataLoader(
+                dataset,
+                batch_size=config.experiment.batch_size,
+                shuffle=True,
+                pin_memory=True,
+            )
 
     def _init_models(self, config):
         n_label_and_props = (
@@ -177,6 +246,24 @@ class Experiment:
 
         self.rnn.initWeight()
 
+        # Wrap models in DDP once, *before* creating optimizers so the
+        # optimizer sees the DDP-wrapped params. `find_unused_parameters=True`
+        # is required because Discriminator_I/V's `label_handler` has an
+        # unused bias when n_label_and_props == 0.
+        if self.is_ddp:
+            self.Di = DDP(
+                self.Di, device_ids=[self.local_rank], find_unused_parameters=True
+            )
+            self.Dv = DDP(
+                self.Dv, device_ids=[self.local_rank], find_unused_parameters=True
+            )
+            self.Gi = DDP(
+                self.Gi, device_ids=[self.local_rank], find_unused_parameters=True
+            )
+            self.rnn = DDP(
+                self.rnn, device_ids=[self.local_rank], find_unused_parameters=True
+            )
+
         self.optim_Di = torch.optim.Adam(
             self.Di.parameters(), lr=self.learning_rate, betas=self.betas
         )
@@ -212,7 +299,10 @@ class Experiment:
                 self.config.paths.output, f"{which}_{epoch:0>6}.pth"
             )
             model = getattr(self, which)
-            model.load_state_dict(torch.load(file_path, map_location=device))
+            state = torch.load(file_path, map_location=device)
+            _unwrap(model).load_state_dict(state) if isinstance(
+                model, torch.nn.Module
+            ) else model.load_state_dict(state)
 
         return epoch
 
@@ -230,11 +320,26 @@ class Experiment:
 
     def save_video(self, folder, video, epoch=None, filename=None, prefix="video_"):
         os.makedirs(folder, exist_ok=True)
-        outputdata = video * 255
-        outputdata = outputdata.astype(np.uint8)
+        video = np.asarray(video, dtype=np.float32)
+        # Generator ends in Tanh → output in [-1, 1] when normalize=1, else
+        # already in [0, 1]. Map both back to [0, 1] before uint8 conversion,
+        # then clip so Tanh excursions past ±1 don't wrap around in uint8 cast.
+        if self.config.video.normalize:
+            video = (video + 1.0) * 0.5
+        video = np.clip(video, 0.0, 1.0)
+        outputdata = (video * 255.0).astype(np.uint8)
+        # libx264 expects 3-channel frames. If the generator runs in grayscale
+        # (ndim_channel=1) the last axis is size 1 — replicate to RGB.
+        if outputdata.ndim == 4 and outputdata.shape[-1] == 1:
+            outputdata = np.repeat(outputdata, 3, axis=-1)
+        elif outputdata.ndim == 3:
+            outputdata = np.stack([outputdata] * 3, axis=-1)
         filename = filename or f"{prefix}{epoch:0>6}"
         file_path = os.path.join(folder, f"{filename}.mp4")
-        skvideo.io.vwrite(file_path, outputdata, verbosity=0)
+        # imageio (via imageio_ffmpeg) ships its own ffmpeg binary, so no
+        # system ffmpeg/ffprobe is required. This matches skvideo's contract.
+        import imageio.v3 as iio
+        iio.imwrite(file_path, outputdata, fps=30, plugin="FFMPEG", codec="libx264")
 
     def save_epoch(self, epoch):
         for which in self.model_names:
@@ -242,7 +347,13 @@ class Experiment:
                 self.config.paths.output, f"{which}_{epoch:0>6}.pth"
             )
             model = getattr(self, which)
-            torch.save(model.state_dict(), file_path)
+            # Strip DDP wrapper so checkpoints load cleanly in non-DDP inference.
+            state = (
+                _unwrap(model).state_dict()
+                if isinstance(model, torch.nn.Module)
+                else model.state_dict()
+            )
+            torch.save(state, file_path)
 
     def get_random_content_vector(self, batch_size, d_C, device, n_frames):
         z_C = Variable(torch.randn(batch_size, d_C))
@@ -261,7 +372,7 @@ class Experiment:
             eps = torch.cat([label_and_props, eps_motion], dim=1)
         else:
             eps = eps_motion
-        rnn.initHidden(batch_size)
+        _unwrap(rnn).initHidden(batch_size)
         # notice that 1st dim of gru outputs is seq_len, 2nd is batch_size
         z_M, dz_M = rnn(eps, n_frames)
         z_M = z_M.transpose(1, 0)
@@ -305,7 +416,7 @@ class Experiment:
         eps = Variable(torch.randn(batch_size, d_E))
         eps = eps.to(device)
 
-        rnn.initHidden(batch_size)
+        _unwrap(rnn).initHidden(batch_size)
         # notice that 1st dim of gru outputs is seq_len, 2nd is batch_size
         z_M = rnn(eps, n_frames).transpose(1, 0)
         return z_M
@@ -317,7 +428,7 @@ class Experiment:
         eps = eps.to(device)
         Z_mass = Z_mass.to(device)
 
-        rnn.initHidden(batch_size)
+        _unwrap(rnn).initHidden(batch_size)
         # notice that 1st dim of hnn outputs is seq_len, 2nd is batch_size
         z_M, z_mass = rnn(eps, Z_mass, n_frames)
 
@@ -507,6 +618,12 @@ class Experiment:
             detector = torch.jit.load(i3d_path).eval().to(device)
 
         batch_size, num_frames, num_channels, height, width = real_videos.shape
+        # I3D expects 3-channel video. For grayscale training (ndim_channel=1)
+        # we replicate the channel to feed the detector.
+        if num_channels == 1:
+            real_videos = np.repeat(real_videos, 3, axis=2)
+            fake_videos = np.repeat(fake_videos, 3, axis=2)
+            num_channels = 3
         assert num_channels == 3, "Inputs should be 3 channels"
 
         resized_real_videos = []
@@ -582,8 +699,9 @@ class Experiment:
                 model = getattr(self, which)
                 model.eval()
 
-        save_config(self.config.paths.output)
-        setup_reproducibility(seed=self.seed)
+        if self.is_main:
+            save_config(self.config.paths.output)
+        setup_reproducibility(seed=self.seed + self.rank)
 
         if self.retrain:
             start_epoch = 0
@@ -592,6 +710,8 @@ class Experiment:
 
         start_time = time.time()
         for epoch in range(start_epoch + 1, self.n_epoch + 1):
+            if self._sampler is not None:
+                self._sampler.set_epoch(epoch)
             err, mean, real_data, fake_data = self.train_step()
 
             real_videos = real_data["videos"]
@@ -601,9 +721,10 @@ class Experiment:
 
             if epoch % self.calculate_fvd_every == 0 or last_epoch:
                 fvd = self.fvd(real_videos=real_videos, fake_videos=fake_videos)
-                logger.info(f"FVD = {fvd}")
+                if self.is_main:
+                    logger.info(f"FVD = {fvd}")
 
-            if epoch % self.print_every == 0 or last_epoch:
+            if self.is_main and (epoch % self.print_every == 0 or last_epoch):
                 logger.info(
                     "[%d/%d] (%s) Loss_Di: %.4f Loss_Dv: %.4f Loss_Gi: %.4f Loss_Gv: %.4f Di_real_mean %.4f Di_fake_mean %.4f Dv_real_mean %.4f Dv_fake_mean %.4f"
                     % (
@@ -621,7 +742,7 @@ class Experiment:
                     )
                 )
 
-            if epoch % self.save_fake_video_every == 0 or last_epoch:
+            if self.is_main and (epoch % self.save_fake_video_every == 0 or last_epoch):
                 self.save_video(
                     self.config.paths.output,
                     fake_videos[0].detach().cpu().numpy().transpose(1, 2, 3, 0),
@@ -629,7 +750,7 @@ class Experiment:
                     prefix="fake_",
                 )
 
-            if epoch % self.save_real_video_every == 0 or last_epoch:
+            if self.is_main and (epoch % self.save_real_video_every == 0 or last_epoch):
                 self.save_video(
                     self.config.paths.output,
                     real_videos[0].detach().cpu().numpy().transpose(1, 2, 3, 0),
@@ -637,8 +758,12 @@ class Experiment:
                     prefix="real_",
                 )
 
-            if epoch % self.save_model_every == 0 or last_epoch:
+            if self.is_main and (epoch % self.save_model_every == 0 or last_epoch):
                 self.save_epoch(epoch)
+
+        if self.is_ddp and dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
 
 
 class ExperimentOld(Experiment):

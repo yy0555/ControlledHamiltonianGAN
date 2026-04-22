@@ -161,3 +161,5 @@ cython_debug/
 
 # setuptools-scm managed version file
 src/hgan/_version.py
+src/hgan/output/
+src/hgan/data/

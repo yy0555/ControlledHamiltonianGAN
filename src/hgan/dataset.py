@@ -1,5 +1,6 @@
 import os
 import glob
+import logging
 import skvideo.io
 from skimage.transform import resize
 import numpy as np
@@ -16,6 +17,8 @@ from hgan.hgn_datasets import (
     variable_physics_hgn,
 )
 from hgan.hgn.environments.environment_factory import EnvFactory
+
+logger = logging.getLogger(__name__)
 
 
 class AviDataset(Dataset):
@@ -398,3 +401,232 @@ class HGNRealtimeDataset(Dataset):
         color_vec[: len(colors)] = colors
 
         return vid, labels_and_props, color_vec
+
+
+class RealPendulumVideoDataset(Dataset):
+    """
+    Real-world double-pendulum video dataset (Mendeley z4hvxjgtbz).
+
+    The source is a single continuous MP4 (`DP_free_drop_video.mp4`). On first
+    use we preprocess it to a memory-mappable uint8 array of resized frames;
+    subsequent runs reuse the cache.
+
+    Returns (video, label_and_props, colors) matching HGNRealtimeDataset so the
+    rest of the pipeline (Generator_I, Discriminator_V, etc.) is unchanged.
+    When ndim_label + ndim_physics + ndim_color == 0 we return empty tensors
+    for those fields (unconditional training).
+    """
+
+    def __init__(
+        self,
+        *,
+        data_dir,
+        video_filename="DP_free_drop_video.mp4",
+        cache_filename=None,
+        num_frames=30,
+        img_size=96,
+        ndim_channel=3,
+        ndim_label=0,
+        ndim_physics=0,
+        ndim_color=0,
+        stride=1,
+        normalize=False,
+        train=True,
+        motion_percentile=0.0,
+    ):
+        self.data_dir = data_dir
+        self.video_path = os.path.join(data_dir, video_filename)
+        # Cache name includes img_size and channel count so switching grayscale
+        # or resolution rebuilds cleanly instead of silently reusing a stale blob.
+        if cache_filename is None:
+            cache_filename = f"frames_{img_size}x{img_size}_{ndim_channel}ch.npy"
+        self.cache_path = os.path.join(data_dir, cache_filename)
+
+        self.num_frames = num_frames
+        self.img_size = img_size
+        self.ndim_channel = ndim_channel
+        self.ndim_label = ndim_label
+        self.ndim_physics = ndim_physics
+        self.ndim_color = ndim_color
+        self.stride = max(int(stride), 1)
+        self.normalize = normalize
+        self.train = train
+
+        # Dummy Embedding so Experiment.save_epoch (which iterates over
+        # model_names including "system_embedding") does not crash. It has no
+        # effect on training since ndim_label is 0 here.
+        self.system_embedding = torch.nn.Embedding(1, max(1, ndim_label))
+
+        # DDP-safe cache build: only rank 0 writes; others wait on a barrier.
+        self._build_cache_if_needed()
+        self.frames = np.load(self.cache_path, mmap_mode="r")
+        self.n_frames_total = self.frames.shape[0]
+
+        clip_span = (self.num_frames - 1) * self.stride + 1
+        if self.n_frames_total < clip_span:
+            raise RuntimeError(
+                f"Not enough frames in cache ({self.n_frames_total}) for a clip "
+                f"of length {self.num_frames} with stride {self.stride}."
+            )
+        self.max_start = self.n_frames_total - clip_span
+
+        # Build a list of clip start indices. When motion_percentile > 0 we
+        # score every possible clip by the average frame-to-frame abs diff
+        # across its frames and keep only those whose score is above the
+        # chosen percentile of the distribution — that filters out the
+        # pre-drop idle period and the long post-damping tail of the video.
+        self.motion_percentile = float(motion_percentile)
+        self.valid_starts = self._compute_valid_starts(self.motion_percentile)
+
+    def _build_cache_if_needed(self):
+        if os.path.exists(self.cache_path):
+            return
+
+        # Under DDP, only rank 0 builds; other ranks wait at a barrier so they
+        # see the finished file when they resume.
+        try:
+            import torch.distributed as dist
+
+            is_distributed = dist.is_available() and dist.is_initialized()
+        except Exception:
+            is_distributed = False
+
+        if is_distributed and dist.get_rank() != 0:
+            dist.barrier()
+            return
+
+        self._build_cache()
+
+        if is_distributed:
+            dist.barrier()
+
+    def _build_cache(self):
+        import cv2
+
+        assert os.path.exists(self.video_path), f"Video not found: {self.video_path}"
+        logger.info("Building frame cache %s from %s", self.cache_path, self.video_path)
+
+        cap = cv2.VideoCapture(self.video_path)
+        n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # Pre-allocate the full array; uint8 keeps memory modest.
+        if self.ndim_channel == 1:
+            out = np.empty((n_total, self.img_size, self.img_size), dtype=np.uint8)
+        else:
+            out = np.empty(
+                (n_total, self.img_size, self.img_size, self.ndim_channel),
+                dtype=np.uint8,
+            )
+
+        i = 0
+        while True:
+            ok, bgr = cap.read()
+            if not ok:
+                break
+            if self.ndim_channel == 1:
+                frame = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            else:
+                # cv2 returns BGR; convert to RGB to match the rest of the pipeline.
+                frame = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            resized = cv2.resize(
+                frame, (self.img_size, self.img_size), interpolation=cv2.INTER_AREA
+            )
+            out[i] = resized
+            i += 1
+            if i % 5000 == 0:
+                logger.info("  processed %d / %d frames", i, n_total)
+        cap.release()
+
+        out = out[:i]  # in case the reported frame count was off
+        # np.save appends `.npy` if the path lacks it, so name the tmp file
+        # with the same extension to guarantee atomic replace.
+        tmp_path = self.cache_path + ".tmp.npy"
+        np.save(tmp_path, out)
+        os.replace(tmp_path, self.cache_path)
+        logger.info("Cached %d frames to %s", out.shape[0], self.cache_path)
+
+    def _compute_valid_starts(self, percentile):
+        """Return the array of clip start indices eligible for sampling.
+
+        If `percentile <= 0` every start is eligible (no filtering). Otherwise
+        each possible start is scored by the mean |frame[t+stride] - frame[t]|
+        over the clip's frames, and only starts whose score is at or above the
+        chosen percentile of the global score distribution are kept. This
+        focuses training on the actively-swinging portion of the video and
+        away from the still/damped segments.
+        """
+        n_starts = self.max_start + 1
+        if percentile <= 0 or n_starts <= 1:
+            return np.arange(n_starts, dtype=np.int64)
+
+        frames = self.frames
+        # Per-interval motion profile at the sampling stride. Subsample
+        # densely (every `step` frames) to keep this fast on long videos.
+        step = max(1, self.stride)
+        pair_indices = np.arange(0, self.n_frames_total - step, step)
+        diffs = np.empty(len(pair_indices), dtype=np.float32)
+        for i, t in enumerate(pair_indices):
+            a = np.asarray(frames[t]).astype(np.float32)
+            b = np.asarray(frames[t + step]).astype(np.float32)
+            diffs[i] = np.abs(a - b).mean()
+
+        # For each possible clip start, compute the mean of the `num_frames-1`
+        # consecutive diffs that fall inside the clip span.
+        scores = np.empty(n_starts, dtype=np.float32)
+        cumsum = np.concatenate(([0.0], np.cumsum(diffs).astype(np.float64)))
+        win = self.num_frames - 1  # diffs per clip
+        for s in range(n_starts):
+            i0 = s // step
+            i1 = min(i0 + win, len(diffs))
+            if i1 <= i0:
+                scores[s] = 0.0
+            else:
+                scores[s] = (cumsum[i1] - cumsum[i0]) / (i1 - i0)
+
+        thresh = np.percentile(scores, percentile)
+        mask = scores >= thresh
+        valid = np.where(mask)[0].astype(np.int64)
+        kept = len(valid)
+        logger.info(
+            "RealPendulumVideoDataset: motion_percentile=%.1f → kept %d / %d "
+            "starts (threshold=%.4f, score range=%.4f-%.4f)",
+            percentile,
+            kept,
+            n_starts,
+            float(thresh),
+            float(scores.min()),
+            float(scores.max()),
+        )
+        if kept == 0:
+            raise RuntimeError(
+                f"motion_percentile={percentile} filtered out every clip"
+            )
+        return valid
+
+    def __len__(self):
+        # Follow the convention of HGNRealtimeDataset (50k / 10k) so the
+        # epoch-based schedule in the .ini works identically. Every
+        # __getitem__ picks a new random clip anyway.
+        return 50_000 if self.train else 10_000
+
+    def __getitem__(self, idx):
+        start = int(self.valid_starts[np.random.randint(0, len(self.valid_starts))])
+        end = start + (self.num_frames - 1) * self.stride + 1
+        # Cache is (T, H, W) for grayscale, (T, H, W, C) for multi-channel.
+        clip = np.asarray(self.frames[start:end:self.stride])
+        if clip.ndim == 3:  # grayscale → add channel dim
+            clip = clip[..., None]
+
+        vid = clip.astype(np.float32) / 255.0
+        if self.normalize:
+            vid = (vid - 0.5) / 0.5
+
+        # (nc, n_frames, img_size, img_size)
+        vid = vid.transpose(3, 0, 1, 2)
+
+        label_and_props = torch.zeros(
+            self.ndim_label + self.ndim_physics, dtype=torch.float32
+        )
+        colors = torch.zeros(self.ndim_color, dtype=torch.float32)
+
+        return vid, label_and_props, colors
